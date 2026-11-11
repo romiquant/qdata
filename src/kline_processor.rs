@@ -153,7 +153,10 @@ pub(crate) struct SegData {
 }
 
 impl SegData {
-    /// start / end / high / low 由调用方传入（来自状态机累加极值）。
+    /// start / end 为段内峰谷 bar 下标。
+    /// high / low 从原始 highs / lows 数组按 [start, end] 区间扫出
+    /// （与 quant-lab `lab.chan` 的峰谷极值语义对齐；状态机累加极值基于
+    /// 交叉窗口，ma5ma10 交叉滞后于价格转向时会丢失真实峰谷，不可用）。
     /// close_min / close_max / close_min_idx / close_max_idx / pct_max / pct_min
     /// 均从 [start, sc_idx) 区间扫出，覆盖完整段移动（与 quant-lab `lab.chan` 对齐）。
     fn compute(
@@ -161,8 +164,8 @@ impl SegData {
         sc_idx: i64,
         start: i64,
         end: i64,
-        high: f64,
-        low: f64,
+        highs: &[f64],
+        lows: &[f64],
         closes: &[f64],
         pct_change: &[f64],
         direction: &'static str,
@@ -170,6 +173,17 @@ impl SegData {
         let n = closes.len();
         let close_lo = start.max(0).min(n as i64 - 1) as usize;
         let close_hi = sc_idx.max(0).min(n as i64).max(close_lo as i64 + 1) as usize;
+
+        // high / low 极值区间：[start, end]（峰谷区间，含端点）。
+        let hl_lo = start.max(0).min(n as i64 - 1) as usize;
+        let hl_hi = (end.max(0) as usize + 1).min(n).max(hl_lo + 1);
+        let hl_highs = &highs[hl_lo..hl_hi];
+        let hl_lows = &lows[hl_lo..hl_hi];
+        let seg_high = hl_highs
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let seg_low = hl_lows.iter().cloned().fold(f64::INFINITY, f64::min);
 
         // close 极值区间：[start, sc_idx)，覆盖完整段移动。
         let close_window = &closes[close_lo..close_hi];
@@ -218,8 +232,8 @@ impl SegData {
         Self {
             start,
             end,
-            high,
-            low,
+            high: seg_high,
+            low: seg_low,
             jc_idx,
             sc_idx,
             close_min,
@@ -748,8 +762,8 @@ impl KlineProcessor {
                 i as i64,
                 self.seg_ma_prev_seg_end,
                 self.seg_ma_running_low_idx,
-                self.seg_ma_running_high,
-                self.seg_ma_running_low,
+                &self.data.highs,
+                &self.data.lows,
                 &self.data.closes,
                 &self.pct_change,
                 "down",
@@ -763,8 +777,8 @@ impl KlineProcessor {
                 i as i64,
                 self.seg_ma_prev_seg_end,
                 self.seg_ma_running_high_idx,
-                self.seg_ma_running_high,
-                self.seg_ma_running_low,
+                &self.data.highs,
+                &self.data.lows,
                 &self.data.closes,
                 &self.pct_change,
                 "up",
@@ -813,8 +827,8 @@ impl KlineProcessor {
                 i as i64,
                 self.seg_macd_prev_seg_end,
                 self.seg_macd_running_low_idx,
-                self.seg_macd_running_high,
-                self.seg_macd_running_low,
+                &self.data.highs,
+                &self.data.lows,
                 &self.data.closes,
                 &self.pct_change,
                 "down",
@@ -828,8 +842,8 @@ impl KlineProcessor {
                 i as i64,
                 self.seg_macd_prev_seg_end,
                 self.seg_macd_running_high_idx,
-                self.seg_macd_running_high,
-                self.seg_macd_running_low,
+                &self.data.highs,
+                &self.data.lows,
                 &self.data.closes,
                 &self.pct_change,
                 "up",
@@ -1189,11 +1203,14 @@ mod seg_binary_layout_tests {
         // 下跌段：start=0, end=2（段内价格极点），但 sc_idx=5 才是下一段金叉。
         // close_min / close_max / pct_max / pct_min 均应覆盖完整段移动 [start, sc_idx)，
         // 而不是仅 [start, end]。
+        // high / low 则按 [start, end] 峰谷区间计算（不扫到 sc_idx）。
         let closes = vec![10.0, 9.0, 8.0, 7.0, 6.0, 11.0];
+        let highs = vec![10.5, 9.5, 8.5, 7.5, 6.5, 11.5];
+        let lows = vec![9.5, 8.5, 7.5, 6.5, 5.5, 10.5];
         let pct_change = vec![0.0, 0.0, 0.0, 5.0, -3.0, 0.0];
         let seg = SegData::compute(
             2, 5, 0, 2,
-            10.0, 6.0,
+            &highs, &lows,
             &closes, &pct_change, "down",
         );
         assert_eq!(seg.close_min, 6.0);
@@ -1203,6 +1220,9 @@ mod seg_binary_layout_tests {
         // pct 也应按 [start, sc_idx) = [0, 5) 计算，覆盖 5.0 与 -3.0
         assert_eq!(seg.pct_max, 5.0);
         assert_eq!(seg.pct_min, -3.0);
+        // high / low 按 [start, end] = [0, 2] 计算，不扫到 sc 窗口
+        assert_eq!(seg.high, 10.5);
+        assert_eq!(seg.low, 7.5);
     }
 
     #[test]
