@@ -1,7 +1,7 @@
 use crate::flight_error::to_flight_error;
 use crate::kline_processor::{KlineProcessor, KlineSeries};
 
-use crate::db::TDEngine;
+use crate::backend::KlineBackend;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::{
     encode::FlightDataEncoderBuilder, flight_service_server::FlightService,
@@ -32,6 +32,9 @@ pub struct DatasetTicket {
     pub kline_snapshot: bool,
     #[serde(default)]
     pub recent_seg_n: usize,
+    /// raw=true 时不做 source!=1 过滤（数据导出管道用；仅 bench 实例启用）。
+    #[serde(default)]
+    pub raw: bool,
 }
 
 /// 已知的周期后缀（长在前，保证 `1d_utc` 优先于 `1d` 匹配）。
@@ -204,7 +207,9 @@ async fn kline_data_to_record_batch(
 }
 #[derive(Clone)]
 pub struct KlineFlightService {
-    db: Arc<TDEngine>,
+    db: Arc<dyn KlineBackend>,
+    /// KLINE_BACKEND=iceberg 时启用；None 走 db（TDengine/QuestDB/CH）原路径。
+    iceberg: Option<Arc<crate::iceberg_store::IcebergStore>>,
 }
 
 impl NamedService for KlineFlightService {
@@ -212,8 +217,11 @@ impl NamedService for KlineFlightService {
 }
 
 impl KlineFlightService {
-    pub fn new(db: Arc<TDEngine>) -> Self {
-        Self { db }
+    pub fn new(
+        db: Arc<dyn KlineBackend>,
+        iceberg: Option<Arc<crate::iceberg_store::IcebergStore>>,
+    ) -> Self {
+        Self { db, iceberg }
     }
 }
 
@@ -267,10 +275,15 @@ impl FlightService for KlineFlightService {
         // Spawn a task to query the database and send batches through the channel
         let producer_handle = tokio::spawn({
             let db = self.db.clone();
+            let iceberg = self.iceberg.clone();
             let default_request = default_request.clone();
             async move {
                 let error_tx = tx.clone();
-                match db.query_kline(&default_request, tx).await {
+                let query_result = match &iceberg {
+                    Some(store) => store.query_kline(&default_request, tx).await,
+                    None => db.query_kline(&default_request, tx).await,
+                };
+                match query_result {
                     Ok(()) => {
                         // Query completed successfully, batches were sent through the channel
                         tracing::info!("Query completed successfully");
@@ -279,7 +292,7 @@ impl FlightService for KlineFlightService {
                         tracing::error!("Query error: {}", e);
                         // Signal the error through the channel so the flight stream
                         // reports it to the client rather than ending silently.
-                        TDEngine::send_or_warn(&error_tx, Err(e)).await;
+                        crate::backend::send_or_warn(&error_tx, Err(e)).await;
                     }
                 }
             }
@@ -300,8 +313,18 @@ impl FlightService for KlineFlightService {
                         let db = db.clone();
                         let kline_aggregate = kline_aggregate.clone();
                         let recent_seg_n = recent_seg_n;
+                        let raw = default_request.raw;
                         async move {
                             let kline_data = result.map_err(to_flight_error)?;
+                            // raw=true：数据导出管道专用，跳过 qfq 复权，透传原始行
+                            // （列名仍映射为 Flight 对外 schema：timestamp/open/...）
+                            if raw {
+                                return kline_data_to_record_batch(
+                                    kline_data, false, String::new(), Vec::new(), false, 0,
+                                )
+                                .await
+                                .map_err(to_flight_error);
+                            }
                             let factors = db
                                 .get_cached_factors(&kline_data.exchange, &kline_data.symbol)
                                 .await
@@ -375,44 +398,24 @@ impl FlightService for KlineFlightService {
         &self,
         _request: Request<Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
-        use std::fs;
-        use std::path::Path;
-        use taos::*;
         use tracing::{error, info};
 
-        // Get a connection from the pool
-        let client =
-            self.db.pool.get().await.map_err(|e| {
-                Status::internal(format!("Failed to get database connection: {}", e))
-            })?;
-
-        // Read SQL file
         let sql_file_path = "./python_client/eth_kline_insert.sql";
-        if !Path::new(sql_file_path).exists() {
+        if !std::path::Path::new(sql_file_path).exists() {
             let error_msg = format!("SQL file not found: {}", sql_file_path);
             error!("{}", error_msg);
             return Err(Status::not_found(error_msg));
         }
 
-        let sql_content = fs::read_to_string(sql_file_path).map_err(|e| {
-            let error_msg = format!("Failed to read SQL file: {}", e);
-            error!("{}", error_msg);
-            Status::internal(error_msg)
-        })?;
+        self.db
+            .execute_sql_file(sql_file_path)
+            .await
+            .map_err(|e| {
+                error!("do_put failed: {}", e);
+                Status::internal(format!("Failed to execute SQL file: {}", e))
+            })?;
 
-        info!("Read SQL file with {} characters", sql_content.len());
-
-        // Execute the SQL
-        match client.exec(sql_content).await {
-            Ok(_) => {
-                info!("Successfully inserted ETH kline data into TDengine");
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to insert ETH kline data: {}", e);
-                error!("{}", error_msg);
-                return Err(Status::internal(error_msg));
-            }
-        }
+        info!("Successfully inserted ETH kline data");
 
         // Create a simple response stream
         let output = futures::stream::once(async { Ok(PutResult::default()) });

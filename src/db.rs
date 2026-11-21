@@ -137,18 +137,22 @@ impl TDEngine {
             freqs.push(format!("'{}'", freq));
         }
 
+        // source!=1 过滤对 raw 与否一致：raw 仅在出口跳过 qfq 复权，
+        // 不改变行集；新库（CH/QDB）入库时按同一谓词预过滤（方案 B）。
+        let source_filter = "AND source !=1 ";
         let sql = format!(
             // kline 库 o/c/h/l 已由 DOUBLE 重建为 DECIMAL(38,18)，
             // SQL 层 cast 回 DOUBLE 以保持 BorrowedValue::Double 解析路径不变（下游精度语义与旧库一致）
             "SELECT exchange, symbol, freq, ts, CAST(o AS DOUBLE), CAST(c AS DOUBLE), CAST(h AS DOUBLE), CAST(l AS DOUBLE), v, qv, end_ts \
              FROM {}.{} \
              WHERE ts>={} AND ts<={} \
-             AND source !=1 AND exchange IN ({}) AND symbol IN ({}) AND freq IN ({}) \
+             {}AND exchange IN ({}) AND symbol IN ({}) AND freq IN ({}) \
              ORDER BY exchange, symbol, freq, ts ASC",
             self.kline_db,
             ticket.name,
             start,
             end,
+            source_filter,
             exchanges.join(","),
             symbols.join(","),
             freqs.join(",")
@@ -294,6 +298,36 @@ impl TDEngine {
         }
         let last_data_time = query_start_time.elapsed().as_millis();
         tracing::info!("last_data_time: {} ms", last_data_time);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::backend::KlineBackend for TDEngine {
+    async fn cache_factors(&self) -> Result<()> {
+        TDEngine::cache_factors(self).await
+    }
+
+    async fn get_cached_factors(
+        &self,
+        exchange: &str,
+        symbol: &str,
+    ) -> Result<Vec<FactorRecord>> {
+        TDEngine::get_cached_factors(self, exchange, symbol).await
+    }
+
+    async fn query_kline(
+        &self,
+        ticket: &DatasetTicket,
+        tx: mpsc::Sender<Result<KlineSeries>>,
+    ) -> Result<()> {
+        TDEngine::query_kline(self, ticket, tx).await
+    }
+
+    async fn execute_sql_file(&self, path: &str) -> Result<()> {
+        let sql = std::fs::read_to_string(path)?;
+        let client = self.pool.get().await?;
+        client.exec(&sql).await.map_err(|e| anyhow!("exec: {e}"))?;
         Ok(())
     }
 }

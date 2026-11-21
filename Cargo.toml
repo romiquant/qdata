@@ -10,6 +10,9 @@ taos = { version = "0.12.3", default-features = false, features = ["optin"] }  #
 taos-query = "0.12.4"  # 查询功能支持
 arrow = { version = "55.2", features = ["prettyprint"] }  # Arrow数据格式
 arrow-flight = { version = "55.2" }  # Arrow Flight协议支持
+parquet = { version = "55.2" }  # Iceberg 数据文件读取（选型基准 iceberg 读后端）
+tokio-postgres = "0.7"  # QuestDB PG wire 读后端
+deadpool-postgres = "0.14"  # QuestDB 连接池
 prost = "0.14.1"  # Protocol Buffers
 anyhow = "1.0"  # 错误处理
 futures = "0.3"  # 异步流处理
