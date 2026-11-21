@@ -6,7 +6,7 @@
 //! - 通过 tx 逐组发送 KlineSeries；无数据时发送一个空 series 保证
 //!   Flight 流含 schema 消息
 //!
-//! 由 `KLINE_BACKEND` 环境变量选择：`tdengine`（默认）/ `questdb` / `clickhouse`。
+//! 由 `KLINE_BACKEND` 环境变量选择：`tdengine`（默认）/ `clickhouse`。
 //! `iceberg` 分支独立于本 trait（直读 parquet 文件，见 iceberg_store）。
 
 use crate::flight_service::DatasetTicket;
