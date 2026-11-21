@@ -168,7 +168,7 @@ impl KlineBackend for ClickHouseBackend {
         // 这里不再过滤；raw 语义仅在 qdata 出口处决定是否做 qfq 复权。
         let sql = format!(
             "SELECT exchange, symbol, freq, ts, o, c, h, l, v, qv, end_ts \
-             FROM kline \
+             FROM kline FINAL \
              WHERE ts >= fromUnixTimestamp64Milli({start_ms}) \
                AND ts <= fromUnixTimestamp64Milli({end_ms}) \
                AND exchange IN ({}) AND symbol IN ({}) AND freq IN ({}) \
