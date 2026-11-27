@@ -166,9 +166,11 @@ impl KlineBackend for ClickHouseBackend {
         let end_ms = ticket.end_time; // 闭区间语义
         // 方案 B：kline 表入库时已预过滤 source!=1（与 TDengine 查询语义一致），
         // 这里不再过滤；raw 语义仅在 qdata 出口处决定是否做 qfq 复权。
+        // kline_view：冷热混合视图（热表 kline FINAL ∪ Iceberg 归档），谓词下推
+        // 经 EXPLAIN ESTIMATE 验证与直查等价；见 ops migrations/clickhouse/000002。
         let sql = format!(
             "SELECT exchange, symbol, freq, ts, o, c, h, l, v, qv, end_ts \
-             FROM kline FINAL \
+             FROM kline_view \
              WHERE ts >= fromUnixTimestamp64Milli({start_ms}) \
                AND ts <= fromUnixTimestamp64Milli({end_ms}) \
                AND exchange IN ({}) AND symbol IN ({}) AND freq IN ({}) \
